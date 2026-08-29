@@ -13,7 +13,7 @@
     4. Input         Mouse aim/fire, keys 1–3, touch aim + battery pad.
     5. Cities        Ground citadels (lives).
     6. Batteries     Ammo silos that fire ABMs.
-    7. Warheads      Incoming polylines, MIRV splits, bombers, spawn queue.
+    7. Warheads      Incoming rockets, MIRV splits, planes, drones, spawn queue.
     8. Blasts        Expanding detonation circles + particles.
     9. Game state    Title, play, pause, tally, win, game over, high score.
    10. Update        Move everything each frame.
@@ -27,43 +27,70 @@
    ============================================================================= */
 
 const CONFIG = {
-  VERSION: "1.0.0",
+  VERSION: "1.1.3",
   WIDTH: 480,
   HEIGHT: 720,
 
   CITY_COUNT: 6,
   BATTERY_COUNT: 3,
-  MISSILES_PER_BATTERY: 10,
-  BLAST_GROW: 120,
+  MISSILES_PER_BATTERY: 12,
+  BLAST_GROW: 60,
   BLAST_HOLD: 0.35,
   BLAST_FADE: 0.45,
-  BLAST_GROW_TIME: 0.22,
+  BLAST_GROW_TIME: 0.18,
   SPLIT_CHANCE: 0.25,
+  SPLIT_CHANCE_STEP: 0.035,
+  SPLIT_CHANCE_MAX: 0.72,
   SPLIT_Y_MIN: 160,
   SPLIT_Y_MAX: 320,
+  SPLIT_Y_WAVE_SHIFT: 14,
   SPLIT_CHILDREN: 2,
-  WAVE_SPEED_STEP: 0.08,
-  BOMBER_FROM_WAVE: 3,
-  BOMBERS_PER_WAVE: 1,
-  BOMBER_SPEED: 55,
-  BOMBER_DROP_GAP: 1.4,
-  BOMBER_Y_MIN: 70,
-  BOMBER_Y_MAX: 160,
-  WAVES_TO_WIN: 10,
+  SPLIT_THREE_FROM_WAVE: 7,
+  SPLIT_THREE_CHANCE: 0.35,
+  WAVE_SPEED_STEP: 0.1,
+
+  PLANE_FROM_WAVE: 3,
+  PLANES_PER_WAVE: 1,
+  PLANE_SPEED: 85,
+  PLANE_SPEED_WAVE: 5,
+  PLANE_DROP_GAP: 1.1,
+  PLANE_DROP_GAP_MIN: 0.4,
+  PLANE_DROP_TIGHTEN: 0.055,
+  PLANE_Y_MIN: 70,
+  PLANE_Y_MAX: 160,
+
+  DRONE_FROM_WAVE: 5,
+  DRONES_PER_WAVE: 1,
+  DRONE_SWARM_SIZE: 9,
+  DRONE_SPACING: 18,
+  DRONE_SPEED: 20,
+  DRONE_SPEED_WAVE: 1.4,
+  DRONE_Y_MIN: 100,
+  DRONE_Y_MAX: 220,
+  DRONE_DIVE_X: 40,
+  DRONE_DIVE_SPEED: 55,
+  DRONE_DIVE_SPEED_WAVE: 3,
+  DRONE_DIVE_STAGGER: 0.12,
+
+  WAVES_TO_WIN: 15,
 
   GROUND_Y: 640,
-  WARHEAD_SPEED: 28,
+  WARHEAD_SPEED: 42,
   WARHEADS_BASE: 6,
   WARHEADS_PER_WAVE: 2,
-  SPAWN_GAP: 0.8,
+  SPAWN_GAP: 0.6,
+  SPAWN_GAP_MIN: 0.18,
+  SPAWN_GAP_TIGHTEN: 0.03,
   SPAWN_STAGGER: 0.35,
   CITY_HIT_RADIUS: 70,
   BATTERY_HIT_RADIUS: 36,
   TALLY_TIME: 2.8,
   TALLY_COUNT_SPEED: 420,
+  ALERT_TIME: 2.4,
 
   SCORE_WARHEAD: 25,
-  SCORE_BOMBER: 100,
+  SCORE_PLANE: 100,
+  SCORE_DRONE: 150,
   SCORE_CITY: 100,
   SCORE_AMMO: 5,
   SCORE_MULT_EVERY: 2,
@@ -83,8 +110,6 @@ const CONFIG = {
   TITLE_PROMPT_DELAY: 3,
   HUD_BAR_H: 52,
 };
-
-const CITY_LABELS = ["AUREL", "NEXIS", "VORN", "KETH", "SOLUM", "RYNN"];
 
 const COLORS = {
   sky: "#0c1018",
@@ -108,8 +133,10 @@ const COLORS = {
   bridgeRail: "#4a4844",
   debug: "#c8f0a8",
   danger: "#d45444",
-  bomber: "#d8c070",
-  bomberWing: "#a89050",
+  plane: "#d8c070",
+  planeWing: "#a89050",
+  drone: "#c8d8e8",
+  droneCore: "#e8f0ff",
   particle: "#ffe0a0",
   flash: "rgba(255, 220, 160, 0.28)",
 };
@@ -256,8 +283,13 @@ function soundSplit() {
   playTone(780, 0.1, "triangle", 0.05, 320, 0.06);
 }
 
-function soundBomber() {
+function soundPlane() {
   playTone(90, 0.5, "sawtooth", 0.045, 60);
+}
+
+function soundDrone() {
+  playTone(260, 0.28, "triangle", 0.05, 180);
+  playTone(180, 0.35, "sine", 0.04, 120, 0.08);
 }
 
 function soundCityDown() {
@@ -572,13 +604,14 @@ function bindInput() {
 }
 
 // -----------------------------------------------------------------------------
-// 5–8. Cities, batteries, warheads, bombers, blasts
+// 5–8. Cities, batteries, warheads, planes, drones, blasts
 // -----------------------------------------------------------------------------
 
 const cities = [];
 const batteries = [];
 const warheads = [];
-const bombers = [];
+const planes = [];
+const drones = [];
 const pending = [];
 const blasts = [];
 const abms = [];
@@ -608,6 +641,41 @@ function scoreMultiplier() {
   return 1 + Math.floor((game.wave - 1) / CONFIG.SCORE_MULT_EVERY);
 }
 
+function splitChance() {
+  return Math.min(
+    CONFIG.SPLIT_CHANCE_MAX,
+    CONFIG.SPLIT_CHANCE + (game.wave - 1) * CONFIG.SPLIT_CHANCE_STEP
+  );
+}
+
+function spawnGapForWave() {
+  return Math.max(
+    CONFIG.SPAWN_GAP_MIN,
+    CONFIG.SPAWN_GAP - (game.wave - 1) * CONFIG.SPAWN_GAP_TIGHTEN
+  );
+}
+
+function planeDropGap() {
+  return Math.max(
+    CONFIG.PLANE_DROP_GAP_MIN,
+    CONFIG.PLANE_DROP_GAP - (game.wave - 1) * CONFIG.PLANE_DROP_TIGHTEN
+  );
+}
+
+function splitYRange(rng) {
+  const shift = (game.wave - 1) * CONFIG.SPLIT_Y_WAVE_SHIFT;
+  const yMin = Math.min(CONFIG.SPLIT_Y_MIN + shift, CONFIG.GROUND_Y - 180);
+  const yMax = Math.min(CONFIG.SPLIT_Y_MAX + shift, CONFIG.GROUND_Y - 80);
+  const lo = Math.min(yMin, yMax);
+  const hi = Math.max(yMin, yMax);
+  return lo + rng() * (hi - lo);
+}
+
+function setWaveAlert(text) {
+  game.alertText = text;
+  game.alertTimer = CONFIG.ALERT_TIME;
+}
+
 function resetCities() {
   cities.length = 0;
   const gap = CONFIG.WIDTH / (CONFIG.CITY_COUNT + 1);
@@ -616,7 +684,6 @@ function resetCities() {
       x: gap * (i + 1),
       y: CONFIG.GROUND_Y,
       alive: true,
-      label: CITY_LABELS[i] || "C" + (i + 1),
       flash: 0,
     });
   }
@@ -638,7 +705,8 @@ function resetBatteries() {
 
 function clearProjectiles() {
   warheads.length = 0;
-  bombers.length = 0;
+  planes.length = 0;
+  drones.length = 0;
   pending.length = 0;
   blasts.length = 0;
   abms.length = 0;
@@ -711,7 +779,7 @@ function destroyBattery(bat) {
 }
 
 function makeWarhead(sx, sy, target, speed, canSplit, rng) {
-  const split = canSplit && rng() < CONFIG.SPLIT_CHANCE;
+  const split = canSplit && rng() < splitChance();
   return {
     x: sx,
     y: sy,
@@ -723,9 +791,7 @@ function makeWarhead(sx, sy, target, speed, canSplit, rng) {
     targetIndex: target.index,
     speed: speed,
     canSplit: split,
-    splitAt: split
-      ? CONFIG.SPLIT_Y_MIN + rng() * (CONFIG.SPLIT_Y_MAX - CONFIG.SPLIT_Y_MIN)
-      : -1,
+    splitAt: split ? splitYRange(rng) : -1,
     alive: true,
   };
 }
@@ -738,42 +804,140 @@ function spawnWarhead(rng) {
   warheads.push(makeWarhead(sx, sy, target, speed, true, rng));
 }
 
-function spawnBomber(rng) {
+function spawnPlane(rng) {
   const fromLeft = rng() < 0.5;
-  const y = CONFIG.BOMBER_Y_MIN + rng() * (CONFIG.BOMBER_Y_MAX - CONFIG.BOMBER_Y_MIN);
-  bombers.push({
+  const y = CONFIG.PLANE_Y_MIN + rng() * (CONFIG.PLANE_Y_MAX - CONFIG.PLANE_Y_MIN);
+  const speed =
+    (CONFIG.PLANE_SPEED + (game.wave - 1) * CONFIG.PLANE_SPEED_WAVE) * (0.9 + rng() * 0.2);
+  planes.push({
     x: fromLeft ? -24 : CONFIG.WIDTH + 24,
     y: y,
     dir: fromLeft ? 1 : -1,
-    speed: CONFIG.BOMBER_SPEED * (0.9 + rng() * 0.2),
-    dropTimer: CONFIG.BOMBER_DROP_GAP * (0.4 + rng() * 0.4),
+    speed: speed,
+    dropTimer: planeDropGap() * (0.4 + rng() * 0.4),
     alive: true,
   });
-  soundBomber();
+  soundPlane();
+}
+
+function spawnDroneSwarm(rng) {
+  const fromLeft = rng() < 0.5;
+  const dir = fromLeft ? 1 : -1;
+  const baseY = CONFIG.DRONE_Y_MIN + rng() * (CONFIG.DRONE_Y_MAX - CONFIG.DRONE_Y_MIN);
+  const speed =
+    (CONFIG.DRONE_SPEED + (game.wave - 1) * CONFIG.DRONE_SPEED_WAVE) * (0.9 + rng() * 0.15);
+  const leadX = fromLeft ? -20 : CONFIG.WIDTH + 20;
+  const swarmId = (game.seed ^ (game.wave * 4099) ^ (drones.length * 17)) >>> 0;
+  for (let i = 0; i < CONFIG.DRONE_SWARM_SIZE; i += 1) {
+    drones.push({
+      x: leadX - dir * i * CONFIG.DRONE_SPACING,
+      y: baseY + (i % 2 === 0 ? 0 : 6) + (i % 3) * 2,
+      dir: dir,
+      speed: speed,
+      bobPhase: rng() * Math.PI * 2,
+      phase: "cruise",
+      diveDelay: i * CONFIG.DRONE_DIVE_STAGGER,
+      diving: false,
+      swarmId: swarmId,
+      lead: i === 0,
+      tx: 0,
+      ty: CONFIG.GROUND_Y,
+      targetKind: "city",
+      targetIndex: -1,
+      vx: 0,
+      vy: 0,
+      alive: true,
+    });
+  }
+  soundDrone();
+}
+
+function beginDroneDive(d, rng) {
+  if (!d.diveAssigned) {
+    const target = pickTarget(rng, true);
+    d.tx = target.x;
+    d.ty = CONFIG.GROUND_Y;
+    d.targetKind = target.kind;
+    d.targetIndex = target.index;
+    d.diveAssigned = true;
+  }
+  d.phase = "dive";
+  d.diving = true;
+
+  const toward = d.tx - d.x;
+  const sign = toward === 0 ? (rng() < 0.5 ? -1 : 1) : toward > 0 ? 1 : -1;
+  const angleBias = 15 + rng() * 65;
+  const diveSpeed =
+    (CONFIG.DRONE_DIVE_SPEED + (game.wave - 1) * CONFIG.DRONE_DIVE_SPEED_WAVE) *
+    (0.9 + rng() * 0.25);
+  const dx = sign * angleBias + toward * 0.35;
+  const dy = Math.max(40, CONFIG.GROUND_Y - d.y);
+  const len = Math.hypot(dx, dy) || 1;
+  d.vx = (dx / len) * diveSpeed;
+  d.vy = (dy / len) * diveSpeed;
+  d.dir = d.vx >= 0 ? 1 : -1;
+}
+
+function triggerSwarmDive(swarmId) {
+  const rng = game.waveRng || makeRng(game.seed);
+  for (let i = 0; i < drones.length; i += 1) {
+    const d = drones[i];
+    if (d.swarmId === swarmId && d.phase === "cruise") {
+      d.phase = "peel";
+    }
+  }
+  // Assign dive targets immediately but wait on diveDelay in update
+  for (let i = 0; i < drones.length; i += 1) {
+    const d = drones[i];
+    if (d.swarmId === swarmId && d.phase === "peel" && !d.diveAssigned) {
+      const target = pickTarget(rng, true);
+      d.tx = target.x;
+      d.ty = CONFIG.GROUND_Y;
+      d.targetKind = target.kind;
+      d.targetIndex = target.index;
+      d.diveAssigned = true;
+    }
+  }
 }
 
 function buildWaveSchedule() {
   pending.length = 0;
   const rng = makeRng(game.seed ^ (game.wave * 9973) ^ 0x51f5);
   const warheadCount = CONFIG.WARHEADS_BASE + (game.wave - 1) * CONFIG.WARHEADS_PER_WAVE;
+  const gap = spawnGapForWave();
   let t = 0.15;
   for (let i = 0; i < warheadCount; i += 1) {
     pending.push({ delay: t, kind: "warhead" });
-    t += CONFIG.SPAWN_GAP + rng() * CONFIG.SPAWN_STAGGER;
+    t += gap + rng() * CONFIG.SPAWN_STAGGER;
   }
-  if (game.wave >= CONFIG.BOMBER_FROM_WAVE) {
-    const bomberCount = CONFIG.BOMBERS_PER_WAVE + Math.floor((game.wave - CONFIG.BOMBER_FROM_WAVE) / 3);
-    for (let i = 0; i < bomberCount; i += 1) {
-      const mid = (i + 1) / (bomberCount + 1);
-      const delay = mid * t * 0.85 + rng() * 0.4;
-      pending.push({ delay: delay, kind: "bomber" });
+
+  if (game.wave >= CONFIG.PLANE_FROM_WAVE) {
+    const planeCount =
+      CONFIG.PLANES_PER_WAVE + Math.floor((game.wave - CONFIG.PLANE_FROM_WAVE) / 2);
+    for (let i = 0; i < planeCount; i += 1) {
+      const mid = (i + 1) / (planeCount + 1);
+      pending.push({ delay: mid * t * 0.85 + rng() * 0.4, kind: "plane" });
     }
-    pending.sort(function (a, b) {
-      return a.delay - b.delay;
-    });
   }
+
+  if (game.wave >= CONFIG.DRONE_FROM_WAVE) {
+    const droneCount =
+      CONFIG.DRONES_PER_WAVE + Math.floor((game.wave - CONFIG.DRONE_FROM_WAVE) / 2);
+    for (let i = 0; i < droneCount; i += 1) {
+      const mid = (i + 1) / (droneCount + 1);
+      pending.push({ delay: mid * t * 0.7 + 0.3 + rng() * 0.5, kind: "drone" });
+    }
+  }
+
+  pending.sort(function (a, b) {
+    return a.delay - b.delay;
+  });
+
   game.spawnElapsed = 0;
   game.waveRng = makeRng(game.seed ^ (game.wave * 7919) ^ 0xa11e);
+
+  if (game.wave === CONFIG.PLANE_FROM_WAVE) setWaveAlert("PLANES INBOUND");
+  else if (game.wave === CONFIG.DRONE_FROM_WAVE) setWaveAlert("DRONES INBOUND");
 }
 
 function updatePending(dt) {
@@ -781,7 +945,8 @@ function updatePending(dt) {
   game.spawnElapsed += dt;
   while (pending.length && pending[0].delay <= game.spawnElapsed) {
     const item = pending.shift();
-    if (item.kind === "bomber") spawnBomber(game.waveRng);
+    if (item.kind === "plane") spawnPlane(game.waveRng);
+    else if (item.kind === "drone") spawnDroneSwarm(game.waveRng);
     else spawnWarhead(game.waveRng);
   }
 }
@@ -789,7 +954,11 @@ function updatePending(dt) {
 function splitWarhead(w, rng) {
   const children = [];
   const used = {};
-  for (let i = 0; i < CONFIG.SPLIT_CHILDREN; i += 1) {
+  let count = CONFIG.SPLIT_CHILDREN;
+  if (game.wave >= CONFIG.SPLIT_THREE_FROM_WAVE && rng() < CONFIG.SPLIT_THREE_CHANCE) {
+    count = 3;
+  }
+  for (let i = 0; i < count; i += 1) {
     let target = pickTarget(rng, true);
     let guard = 0;
     while (used[target.kind + ":" + target.index] && guard < 6) {
@@ -851,7 +1020,7 @@ function tryFireAt(tx, ty, preferBattery) {
 
   abms.push({
     x: bat.x,
-    y: bat.y - 10,
+    y: bat.y - 40,
     tx: tx,
     ty: ty,
     speed: 380,
@@ -969,31 +1138,31 @@ function updateWarheads(dt) {
   for (let i = 0; i < newborns.length; i += 1) warheads.push(newborns[i]);
 }
 
-function updateBombers(dt) {
-  for (let i = bombers.length - 1; i >= 0; i -= 1) {
-    const bom = bombers[i];
-    if (!bom.alive) {
-      bombers.splice(i, 1);
+function updatePlanes(dt) {
+  for (let i = planes.length - 1; i >= 0; i -= 1) {
+    const pl = planes[i];
+    if (!pl.alive) {
+      planes.splice(i, 1);
       continue;
     }
 
-    bom.x += bom.dir * bom.speed * dt;
-    bom.dropTimer -= dt;
-    if (bom.dropTimer <= 0 && livingCityCount() > 0) {
-      bom.dropTimer = CONFIG.BOMBER_DROP_GAP;
+    pl.x += pl.dir * pl.speed * dt;
+    pl.dropTimer -= dt;
+    if (pl.dropTimer <= 0 && livingCityCount() > 0) {
+      pl.dropTimer = planeDropGap();
       const rng = game.waveRng || makeRng(game.seed);
       const target = pickTarget(rng, true);
       const speed = waveSpeed() * (0.95 + rng() * 0.2);
-      warheads.push(makeWarhead(bom.x, bom.y + 6, target, speed, false, rng));
+      warheads.push(makeWarhead(pl.x, pl.y + 6, target, speed, false, rng));
     }
 
     let killed = false;
     for (let j = 0; j < blasts.length; j += 1) {
       const b = blasts[j];
-      if (Math.hypot(bom.x - b.x, bom.y - b.y) < b.r + 8) {
-        bom.alive = false;
-        addScore(CONFIG.SCORE_BOMBER * scoreMultiplier());
-        spawnParticles(bom.x, bom.y, 18, 150);
+      if (Math.hypot(pl.x - b.x, pl.y - b.y) < b.r + 8) {
+        pl.alive = false;
+        addScore(CONFIG.SCORE_PLANE * scoreMultiplier());
+        spawnParticles(pl.x, pl.y, 18, 150);
         soundHit();
         soundBoom();
         killed = true;
@@ -1001,12 +1170,74 @@ function updateBombers(dt) {
       }
     }
     if (killed) {
-      bombers.splice(i, 1);
+      planes.splice(i, 1);
       continue;
     }
 
-    if (bom.x < -40 || bom.x > CONFIG.WIDTH + 40) {
-      bombers.splice(i, 1);
+    if (pl.x < -40 || pl.x > CONFIG.WIDTH + 40) {
+      planes.splice(i, 1);
+    }
+  }
+}
+
+function updateDrones(dt) {
+  const midX = CONFIG.WIDTH / 2;
+  const rng = game.waveRng || makeRng(game.seed);
+
+  for (let i = drones.length - 1; i >= 0; i -= 1) {
+    const d = drones[i];
+    if (!d.alive) {
+      drones.splice(i, 1);
+      continue;
+    }
+
+    if (d.phase === "cruise") {
+      d.bobPhase = (d.bobPhase || 0) + dt * 3;
+      d.x += d.dir * d.speed * dt;
+      d.y += Math.sin(d.bobPhase) * 6 * dt;
+
+      if (Math.abs(d.x - midX) < CONFIG.DRONE_DIVE_X) {
+        triggerSwarmDive(d.swarmId);
+      }
+    } else if (d.phase === "peel") {
+      d.diveDelay -= dt;
+      d.bobPhase = (d.bobPhase || 0) + dt * 3;
+      d.y += Math.sin(d.bobPhase) * 3 * dt;
+      if (d.diveDelay <= 0) {
+        beginDroneDive(d, rng);
+      }
+    } else if (d.phase === "dive") {
+      d.x += d.vx * dt;
+      d.y += d.vy * dt;
+    }
+
+    let killed = false;
+    for (let j = 0; j < blasts.length; j += 1) {
+      const b = blasts[j];
+      if (Math.hypot(d.x - b.x, d.y - b.y) < b.r + 6) {
+        d.alive = false;
+        addScore(CONFIG.SCORE_DRONE * scoreMultiplier());
+        spawnParticles(d.x, d.y, 12, 110);
+        soundHit();
+        killed = true;
+        break;
+      }
+    }
+    if (killed) {
+      drones.splice(i, 1);
+      continue;
+    }
+
+    if (d.phase === "dive" && d.y >= CONFIG.GROUND_Y - 2) {
+      applyGroundHit(d);
+      drones.splice(i, 1);
+      continue;
+    }
+
+    if (d.phase === "cruise") {
+      const pastExit =
+        (d.dir > 0 && d.x > CONFIG.WIDTH + 80) || (d.dir < 0 && d.x < -80);
+      if (pastExit) drones.splice(i, 1);
     }
   }
 }
@@ -1077,6 +1308,8 @@ const game = {
   tallyMult: 1,
   spawnElapsed: 0,
   waveRng: null,
+  alertText: "",
+  alertTimer: 0,
   newRecord: false,
   startHigh: 0,
   debug: false,
@@ -1175,6 +1408,8 @@ function startRun(freshSeed) {
   game.tallyDisplay = 0;
   game.tallyAwarded = 0;
   game.tallyMult = 1;
+  game.alertText = "";
+  game.alertTimer = 0;
   game.newRecord = false;
   game.startHigh = game.highScore;
   aim.x = CONFIG.WIDTH / 2;
@@ -1194,7 +1429,8 @@ function checkWaveClearOrLoss() {
   if (
     pending.length === 0 &&
     warheads.length === 0 &&
-    bombers.length === 0 &&
+    planes.length === 0 &&
+    drones.length === 0 &&
     abms.length === 0 &&
     blasts.length === 0
   ) {
@@ -1225,6 +1461,7 @@ function update(dt) {
   }
   updateFlashes(dt);
   updateParticles(dt);
+  if (game.alertTimer > 0) game.alertTimer -= dt;
 
   if (game.state === "title") return;
   if (game.state === "paused" || game.state === "gameover" || game.state === "won") return;
@@ -1252,7 +1489,8 @@ function update(dt) {
   updatePending(dt);
   updateAbms(dt);
   updateWarheads(dt);
-  updateBombers(dt);
+  updatePlanes(dt);
+  updateDrones(dt);
   updateBlasts(dt);
   checkWaveClearOrLoss();
 }
@@ -1287,25 +1525,35 @@ function drawGround(ctx) {
 function drawCities(ctx) {
   for (let i = 0; i < cities.length; i += 1) {
     const c = cities[i];
-    ctx.fillStyle = c.alive ? COLORS.city : COLORS.cityDead;
-    ctx.beginPath();
-    ctx.moveTo(c.x, c.y - 22);
-    ctx.lineTo(c.x + 14, c.y);
-    ctx.lineTo(c.x - 14, c.y);
-    ctx.closePath();
-    ctx.fill();
+    const base = c.alive ? COLORS.city : COLORS.cityDead;
+    const accent = c.alive ? COLORS.accent : COLORS.bridgeRail;
+    const windowColor = c.alive ? "#1a2838" : "#12161c";
+
+    // Main block
+    ctx.fillStyle = base;
+    ctx.fillRect(c.x - 12, c.y - 20, 24, 20);
+    // Left annex
+    ctx.fillRect(c.x - 18, c.y - 12, 8, 12);
+    // Right tower
+    ctx.fillRect(c.x + 8, c.y - 28, 10, 28);
+    // Flat roof caps
+    ctx.fillStyle = accent;
+    ctx.fillRect(c.x - 13, c.y - 22, 26, 3);
+    ctx.fillRect(c.x + 7, c.y - 30, 12, 3);
+    // Windows
+    ctx.fillStyle = windowColor;
+    ctx.fillRect(c.x - 8, c.y - 16, 4, 4);
+    ctx.fillRect(c.x - 2, c.y - 16, 4, 4);
+    ctx.fillRect(c.x - 8, c.y - 9, 4, 4);
+    ctx.fillRect(c.x - 2, c.y - 9, 4, 4);
+    ctx.fillRect(c.x + 11, c.y - 24, 3, 3);
+    ctx.fillRect(c.x + 11, c.y - 18, 3, 3);
+
     if (c.flash > 0) {
       ctx.fillStyle = COLORS.flash;
       ctx.beginPath();
-      ctx.arc(c.x, c.y - 8, 22, 0, Math.PI * 2);
+      ctx.arc(c.x, c.y - 12, 24, 0, Math.PI * 2);
       ctx.fill();
-    }
-    if (c.alive) {
-      ctx.fillStyle = COLORS.text;
-      ctx.font = "8px Courier New, monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      ctx.fillText(c.label, c.x, c.y + 4);
     }
   }
 }
@@ -1314,22 +1562,65 @@ function drawBatteries(ctx) {
   for (let i = 0; i < batteries.length; i += 1) {
     const b = batteries[i];
     const selected = aim.selectedBattery === i;
-    ctx.fillStyle = b.alive ? COLORS.battery : COLORS.batteryDead;
-    ctx.fillRect(b.x - 14, b.y - 18, 28, 18);
+    const hull = b.alive ? COLORS.battery : COLORS.batteryDead;
+    const trim = b.alive ? COLORS.ammo : COLORS.cityDead;
+    const pad = b.alive ? COLORS.groundLine : COLORS.bridgeRail;
+    const cabin = b.alive ? COLORS.bridge : COLORS.bridgeRail;
+
+    // Flat pad
+    ctx.fillStyle = pad;
+    ctx.fillRect(b.x - 24, b.y - 4, 48, 6);
+
+    // Control cabin (left)
+    ctx.fillStyle = cabin;
+    ctx.fillRect(b.x - 22, b.y - 18, 14, 14);
+    ctx.fillStyle = trim;
+    ctx.fillRect(b.x - 19, b.y - 15, 3, 3);
+    ctx.fillRect(b.x - 14, b.y - 15, 3, 3);
+    // Radar mast + dish on cabin
+    ctx.fillStyle = hull;
+    ctx.fillRect(b.x - 16, b.y - 28, 2, 10);
+    ctx.beginPath();
+    ctx.arc(b.x - 15, b.y - 30, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = trim;
+    ctx.fillRect(b.x - 18, b.y - 31, 6, 2);
+
+    // Launcher box (right of cabin)
+    ctx.fillStyle = hull;
+    ctx.fillRect(b.x - 4, b.y - 26, 26, 22);
+    ctx.fillStyle = b.alive ? COLORS.bridgeRail : COLORS.cityDead;
+    ctx.fillRect(b.x - 2, b.y - 24, 22, 18);
+
+    // Stacked horizontal canisters, slightly stepped up (Patriot look)
+    ctx.fillStyle = trim;
+    for (let t = 0; t < 4; t += 1) {
+      const ty = b.y - 22 + t * 4;
+      const tx = b.x + 2 + (3 - t);
+      ctx.fillRect(tx, ty, 16, 3);
+    }
+    // Front caps
+    ctx.fillStyle = hull;
+    for (let t = 0; t < 4; t += 1) {
+      const ty = b.y - 22 + t * 4;
+      const tx = b.x + 2 + (3 - t) + 16;
+      ctx.fillRect(tx, ty, 2, 3);
+    }
+
     if (b.flash > 0) {
       ctx.fillStyle = COLORS.flash;
-      ctx.fillRect(b.x - 18, b.y - 22, 36, 26);
+      ctx.fillRect(b.x - 26, b.y - 36, 54, 38);
     }
     if (selected && b.alive) {
       ctx.strokeStyle = COLORS.accent;
       ctx.lineWidth = 2;
-      ctx.strokeRect(b.x - 16, b.y - 20, 32, 22);
+      ctx.strokeRect(b.x - 26, b.y - 36, 54, 38);
     }
     ctx.fillStyle = b.alive ? COLORS.ammo : COLORS.cityDead;
     ctx.font = "bold 12px Courier New, monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";
-    ctx.fillText(String(b.ammo), b.x, b.y - 22);
+    ctx.fillText(String(b.ammo), b.x, b.y - 38);
   }
 }
 
@@ -1349,20 +1640,40 @@ function drawWarheads(ctx) {
   }
 }
 
-function drawBombers(ctx) {
-  for (let i = 0; i < bombers.length; i += 1) {
-    const bom = bombers[i];
-    const dir = bom.dir;
-    ctx.fillStyle = COLORS.bomber;
+function drawPlanes(ctx) {
+  for (let i = 0; i < planes.length; i += 1) {
+    const pl = planes[i];
+    const dir = pl.dir;
+    ctx.fillStyle = COLORS.plane;
     ctx.beginPath();
-    ctx.moveTo(bom.x + dir * 14, bom.y);
-    ctx.lineTo(bom.x - dir * 8, bom.y - 7);
-    ctx.lineTo(bom.x - dir * 4, bom.y);
-    ctx.lineTo(bom.x - dir * 8, bom.y + 7);
+    ctx.moveTo(pl.x + dir * 14, pl.y);
+    ctx.lineTo(pl.x - dir * 8, pl.y - 7);
+    ctx.lineTo(pl.x - dir * 4, pl.y);
+    ctx.lineTo(pl.x - dir * 8, pl.y + 7);
     ctx.closePath();
     ctx.fill();
-    ctx.fillStyle = COLORS.bomberWing;
-    ctx.fillRect(bom.x - 10, bom.y - 2, 20, 4);
+    ctx.fillStyle = COLORS.planeWing;
+    ctx.fillRect(pl.x - 10, pl.y - 2, 20, 4);
+  }
+}
+
+function drawDrones(ctx) {
+  for (let i = 0; i < drones.length; i += 1) {
+    const d = drones[i];
+    const nose = d.dir > 0 ? d.x + 6 : d.x - 6;
+    const tail = d.dir > 0 ? d.x - 6 : d.x + 6;
+    const left = Math.min(nose, tail);
+    const width = Math.abs(nose - tail);
+    // Fuselage
+    ctx.fillStyle = COLORS.drone;
+    ctx.fillRect(left, d.y - 2, width, 4);
+    // Wings
+    ctx.fillStyle = COLORS.droneCore;
+    ctx.fillRect(d.x - 7, d.y - 1, 14, 2);
+    ctx.fillStyle = COLORS.drone;
+    ctx.fillRect(d.x - 8, d.y - 5, 16, 2);
+    // Tail fin
+    ctx.fillRect(tail - (d.dir > 0 ? 0 : 2), d.y - 5, 2, 5);
   }
 }
 
@@ -1438,12 +1749,8 @@ function drawCitadelRow(ctx) {
   for (let i = 0; i < cities.length; i += 1) {
     const cx = startX + i * 16 + 6;
     ctx.fillStyle = cities[i].alive ? COLORS.city : COLORS.cityDead;
-    ctx.beginPath();
-    ctx.moveTo(cx, y - 8);
-    ctx.lineTo(cx + 6, y);
-    ctx.lineTo(cx - 6, y);
-    ctx.closePath();
-    ctx.fill();
+    ctx.fillRect(cx - 4, y - 8, 8, 8);
+    ctx.fillRect(cx - 2, y - 11, 4, 3);
   }
 }
 
@@ -1477,6 +1784,15 @@ function drawHud(ctx) {
     ctx.font = "11px Courier New, monospace";
     ctx.textAlign = "left";
     ctx.fillText(music.on ? "MUSIC ON" : "MUSIC OFF", 8, 58);
+  }
+
+  if (game.alertTimer > 0 && game.alertText) {
+    const pulse = Math.floor(game.time * 4) % 2 === 0;
+    ctx.fillStyle = pulse ? COLORS.accent : COLORS.text;
+    ctx.font = "bold 16px Courier New, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(game.alertText, CONFIG.WIDTH / 2, CONFIG.HUD_BAR_H + 10);
   }
 }
 
@@ -1554,7 +1870,14 @@ function drawDebug(ctx) {
   ctx.fillText("SEED " + game.seed, 8, 82);
   ctx.fillText("CITIES " + livingCityCount(), 8, 98);
   ctx.fillText(
-    "IN " + warheads.length + " B " + bombers.length + " Q " + pending.length,
+    "R " +
+      warheads.length +
+      " P " +
+      planes.length +
+      " D " +
+      drones.length +
+      " Q " +
+      pending.length,
     8,
     114
   );
@@ -1653,7 +1976,8 @@ function draw(ctx) {
     drawCities(ctx);
     drawBatteries(ctx);
     drawWarheads(ctx);
-    drawBombers(ctx);
+    drawPlanes(ctx);
+    drawDrones(ctx);
     drawAbms(ctx);
     drawBlasts(ctx);
     drawParticles(ctx);

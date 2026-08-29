@@ -36,4 +36,4 @@ Missing files are fine — the game still runs; music just stays silent. Volume 
 
 ## Build from
 
-Read [PROMPT.md](PROMPT.md). The current `game.js` is a runnable stub harness.
+Read [PROMPT.md](PROMPT.md). Enemies: rockets every wave (faster splits later), planes from wave 3, evasive drones from wave 5. Interceptor blasts are tight — aim carefully.
