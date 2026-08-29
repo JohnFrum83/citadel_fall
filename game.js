@@ -27,7 +27,7 @@
    ============================================================================= */
 
 const CONFIG = {
-  VERSION: "1.1.3",
+  VERSION: "1.1.4",
   WIDTH: 480,
   HEIGHT: 720,
 
@@ -354,44 +354,46 @@ function gamePointFromClient(clientX, clientY) {
 }
 
 const hudButtons = {
-  pause: { x: CONFIG.WIDTH - 60, y: 6, w: 52, h: 52 },
-  music: { x: 6, y: 88, w: 52, h: 52 },
+  pause: { x: CONFIG.WIDTH - 68, y: 4, w: 64, h: 64 },
+  music: { x: 4, y: 84, w: 64, h: 64 },
 };
+
+/** Minimum finger target in CSS pixels (~44pt Apple HIG). */
+const TOUCH_MIN_CSS = 44;
 
 function hitHudButton(clientX, clientY) {
   if (!touchUi.active) return null;
   const p = gamePointFromClient(clientX, clientY);
-  if (
-    p.x >= hudButtons.pause.x &&
-    p.x <= hudButtons.pause.x + hudButtons.pause.w &&
-    p.y >= hudButtons.pause.y &&
-    p.y <= hudButtons.pause.y + hudButtons.pause.h
-  ) {
-    return "pause";
+  const scale = touchLayout.scale || 1;
+  const padGame = Math.max(0, (TOUCH_MIN_CSS / scale - 64) / 2);
+
+  function inBtn(btn) {
+    return (
+      p.x >= btn.x - padGame &&
+      p.x <= btn.x + btn.w + padGame &&
+      p.y >= btn.y - padGame &&
+      p.y <= btn.y + btn.h + padGame
+    );
   }
-  if (
-    p.x >= hudButtons.music.x &&
-    p.x <= hudButtons.music.x + hudButtons.music.w &&
-    p.y >= hudButtons.music.y &&
-    p.y <= hudButtons.music.y + hudButtons.music.h
-  ) {
-    return "music";
-  }
+
+  if (inBtn(hudButtons.pause)) return "pause";
+  if (inBtn(hudButtons.music)) return "music";
   return null;
 }
 
 function padBatteryFromClient(clientX, clientY) {
   if (!padCanvas || !touchLayout.deckVisible) return -1;
   const rect = padCanvas.getBoundingClientRect();
+  const padCss = 8;
   if (
-    clientX < rect.left ||
-    clientX > rect.right ||
-    clientY < rect.top ||
-    clientY > rect.bottom
+    clientX < rect.left - padCss ||
+    clientX > rect.right + padCss ||
+    clientY < rect.top - padCss ||
+    clientY > rect.bottom + padCss
   ) {
     return -1;
   }
-  const localX = ((clientX - rect.left) / rect.width) * CONFIG.WIDTH;
+  const localX = ((clientX - rect.left) / Math.max(1, rect.width)) * CONFIG.WIDTH;
   const slot = Math.floor(localX / (CONFIG.WIDTH / CONFIG.BATTERY_COUNT));
   return clamp(slot, 0, CONFIG.BATTERY_COUNT - 1);
 }
@@ -415,7 +417,7 @@ function swallowActiveTouches() {
   });
 }
 
-function bindPointerControls() {
+function bindMouseControls() {
   canvas.addEventListener("mousemove", function (event) {
     if (touchUi.active) return;
     const p = gamePointFromClient(event.clientX, event.clientY);
@@ -446,8 +448,82 @@ function bindPointerControls() {
   });
 }
 
-function bindTouchControls() {
-  const frame = document.getElementById("frame");
+function handleTapStart(clientX, clientY, id) {
+  if (touchRoles.has(id)) return;
+
+  const hud = hitHudButton(clientX, clientY);
+  if (hud) {
+    touchRoles.set(id, { role: "ui" });
+    handleHudTap(hud);
+    return;
+  }
+
+  const bat = padBatteryFromClient(clientX, clientY);
+  if (bat >= 0) {
+    aim.selectedBattery = bat;
+    padUi.flash[bat] = 0.15;
+    touchRoles.set(id, { role: "ui" });
+    return;
+  }
+
+  if (game.state === "title" || game.state === "gameover" || game.state === "won") {
+    startRun(true);
+    touchRoles.set(id, { role: "swallow" });
+    return;
+  }
+
+  if (game.state === "paused") {
+    game.state = "playing";
+    touchRoles.set(id, { role: "swallow" });
+    return;
+  }
+
+  if (game.state === "tally") {
+    endTally();
+    touchRoles.set(id, { role: "swallow" });
+    return;
+  }
+
+  if (game.state !== "playing") return;
+
+  const p = gamePointFromClient(clientX, clientY);
+  aim.x = clamp(p.x, 0, CONFIG.WIDTH);
+  aim.y = clamp(p.y, 0, CONFIG.HEIGHT);
+  touchRoles.set(id, {
+    role: "aim",
+    startX: clientX,
+    startY: clientY,
+    moved: false,
+  });
+}
+
+function handleTapMove(clientX, clientY, id) {
+  const meta = touchRoles.get(id);
+  if (!meta || meta.role !== "aim") return;
+
+  const dx = clientX - meta.startX;
+  const dy = clientY - meta.startY;
+  if (Math.hypot(dx, dy) > 8) meta.moved = true;
+
+  const p = gamePointFromClient(clientX, clientY);
+  aim.x = clamp(p.x, 0, CONFIG.WIDTH);
+  aim.y = clamp(p.y, 0, CONFIG.HEIGHT);
+}
+
+function handleTapEnd(clientX, clientY, id) {
+  const meta = touchRoles.get(id);
+  if (!meta) return;
+
+  if (meta.role === "aim" && game.state === "playing") {
+    const p = gamePointFromClient(clientX, clientY);
+    aim.x = clamp(p.x, 0, CONFIG.WIDTH);
+    aim.y = clamp(p.y, 0, CONFIG.HEIGHT);
+    tryFireAt(aim.x, aim.y, aim.selectedBattery);
+  }
+  touchRoles.delete(id);
+}
+
+function bindFramePointerControls(frame) {
   const opts = { passive: false };
 
   function ensureTouchUi() {
@@ -458,96 +534,110 @@ function bindTouchControls() {
     }
   }
 
-  function onTouchStart(event) {
-    ensureTouchUi();
-    unlockAudio();
+  frame.addEventListener(
+    "pointerdown",
+    function (event) {
+      if (event.pointerType === "mouse") return;
+      ensureTouchUi();
+      unlockAudio();
+      canvas.focus();
+      event.preventDefault();
+      try {
+        frame.setPointerCapture(event.pointerId);
+      } catch (_e) {
+        /* ignore */
+      }
+      handleTapStart(event.clientX, event.clientY, "p" + event.pointerId);
+    },
+    opts
+  );
+
+  frame.addEventListener(
+    "pointermove",
+    function (event) {
+      if (event.pointerType === "mouse") return;
+      if (!touchRoles.size) return;
+      event.preventDefault();
+      handleTapMove(event.clientX, event.clientY, "p" + event.pointerId);
+    },
+    opts
+  );
+
+  function onPointerUp(event) {
+    if (event.pointerType === "mouse") return;
+    const id = "p" + event.pointerId;
+    if (!touchRoles.has(id)) return;
     event.preventDefault();
+    handleTapEnd(event.clientX, event.clientY, id);
+  }
 
-    for (let i = 0; i < event.changedTouches.length; i += 1) {
-      const t = event.changedTouches[i];
-      if (touchRoles.has(t.identifier)) continue;
+  frame.addEventListener("pointerup", onPointerUp, opts);
+  frame.addEventListener("pointercancel", onPointerUp, opts);
+}
 
-      const hud = hitHudButton(t.clientX, t.clientY);
-      if (hud) {
-        touchRoles.set(t.identifier, { role: "ui" });
-        handleHudTap(hud);
-        continue;
-      }
+function bindFrameTouchControls(frame) {
+  const opts = { passive: false };
 
-      const bat = padBatteryFromClient(t.clientX, t.clientY);
-      if (bat >= 0) {
-        aim.selectedBattery = bat;
-        padUi.flash[bat] = 0.15;
-        touchRoles.set(t.identifier, { role: "ui" });
-        continue;
-      }
-
-      if (game.state === "title" || game.state === "gameover" || game.state === "won") {
-        startRun(true);
-        touchRoles.set(t.identifier, { role: "swallow" });
-        continue;
-      }
-
-      if (game.state === "paused") {
-        game.state = "playing";
-        touchRoles.set(t.identifier, { role: "swallow" });
-        continue;
-      }
-
-      if (game.state !== "playing") continue;
-
-      const p = gamePointFromClient(t.clientX, t.clientY);
-      aim.x = clamp(p.x, 0, CONFIG.WIDTH);
-      aim.y = clamp(p.y, 0, CONFIG.HEIGHT);
-      touchRoles.set(t.identifier, {
-        role: "aim",
-        startX: t.clientX,
-        startY: t.clientY,
-        moved: false,
-      });
+  function ensureTouchUi() {
+    if (!touchUi.active) {
+      touchUi.active = true;
+      loadTouchPrefs();
+      fitLayout();
     }
   }
 
-  function onTouchMove(event) {
-    if (!touchRoles.size) return;
-    event.preventDefault();
+  frame.addEventListener(
+    "touchstart",
+    function (event) {
+      ensureTouchUi();
+      unlockAudio();
+      canvas.focus();
+      event.preventDefault();
+      for (let i = 0; i < event.changedTouches.length; i += 1) {
+        const t = event.changedTouches[i];
+        handleTapStart(t.clientX, t.clientY, "t" + t.identifier);
+      }
+    },
+    opts
+  );
 
-    for (let i = 0; i < event.changedTouches.length; i += 1) {
-      const t = event.changedTouches[i];
-      const meta = touchRoles.get(t.identifier);
-      if (!meta || meta.role !== "aim") continue;
-
-      const dx = t.clientX - meta.startX;
-      const dy = t.clientY - meta.startY;
-      if (Math.hypot(dx, dy) > 8) meta.moved = true;
-
-      const p = gamePointFromClient(t.clientX, t.clientY);
-      aim.x = clamp(p.x, 0, CONFIG.WIDTH);
-      aim.y = clamp(p.y, 0, CONFIG.HEIGHT);
-    }
-  }
+  frame.addEventListener(
+    "touchmove",
+    function (event) {
+      if (!touchRoles.size) return;
+      event.preventDefault();
+      for (let i = 0; i < event.changedTouches.length; i += 1) {
+        const t = event.changedTouches[i];
+        handleTapMove(t.clientX, t.clientY, "t" + t.identifier);
+      }
+    },
+    opts
+  );
 
   function onTouchEnd(event) {
     for (let i = 0; i < event.changedTouches.length; i += 1) {
       const t = event.changedTouches[i];
-      const meta = touchRoles.get(t.identifier);
-      if (!meta) continue;
+      const id = "t" + t.identifier;
+      if (!touchRoles.has(id)) continue;
       event.preventDefault();
-
-      if (meta.role === "aim" && game.state === "playing") {
-        const p = gamePointFromClient(t.clientX, t.clientY);
-        aim.x = clamp(p.x, 0, CONFIG.WIDTH);
-        aim.y = clamp(p.y, 0, CONFIG.HEIGHT);
-        tryFireAt(aim.x, aim.y, aim.selectedBattery);
-      }
-      touchRoles.delete(t.identifier);
+      handleTapEnd(t.clientX, t.clientY, id);
     }
   }
 
-  frame.addEventListener("touchstart", onTouchStart, opts);
-  frame.addEventListener("touchmove", onTouchMove, opts);
   frame.addEventListener("touchend", onTouchEnd, opts);
   frame.addEventListener("touchcancel", onTouchEnd, opts);
+}
+
+function bindTouchControls() {
+  const frame = document.getElementById("frame");
+  if (!frame) return;
+
+  // Pointer Events are more reliable on iPhone Chrome; Touch Events as fallback.
+  if (window.PointerEvent) {
+    bindFramePointerControls(frame);
+  } else {
+    bindFrameTouchControls(frame);
+  }
 
   frame.addEventListener("gesturestart", function (event) {
     event.preventDefault();
@@ -1777,8 +1867,8 @@ function drawHud(ctx) {
     ctx.fillStyle = COLORS.text;
     ctx.font = "10px Courier New, monospace";
     ctx.textAlign = "center";
-    ctx.fillText("II", pb.x + pb.w / 2, pb.y + 22);
-    ctx.fillText(music.on ? "MUS" : "OFF", mb.x + mb.w / 2, mb.y + 22);
+    ctx.fillText("II", pb.x + pb.w / 2, pb.y + pb.h / 2 - 4);
+    ctx.fillText(music.on ? "MUS" : "OFF", mb.x + mb.w / 2, mb.y + mb.h / 2 - 4);
   } else if (CONFIG.MUSIC_TRACKS.length) {
     ctx.fillStyle = music.on ? COLORS.text : COLORS.danger;
     ctx.font = "11px Courier New, monospace";
@@ -2051,12 +2141,15 @@ function loop(timestamp) {
 function boot() {
   loadTouchPrefs();
   bindInput();
-  bindPointerControls();
+  bindMouseControls();
   bindTouchControls();
   window.addEventListener("resize", fitLayout);
-  window.addEventListener("orientationchange", fitLayout);
+  window.addEventListener("orientationchange", function () {
+    setTimeout(fitLayout, 80);
+  });
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", fitLayout);
+    window.visualViewport.addEventListener("scroll", fitLayout);
   }
   fitLayout();
   game.seed = newSeed();
