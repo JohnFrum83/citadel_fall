@@ -13,8 +13,8 @@
     4. Input         Mouse aim/fire, keys 1–3, touch aim + battery pad.
     5. Cities        Ground citadels (lives).
     6. Batteries     Ammo silos that fire ABMs.
-    7. Warheads      Incoming polylines (stub MIRV / bomber hooks).
-    8. Blasts        Expanding detonation circles.
+    7. Warheads      Incoming polylines, MIRV splits, bombers, spawn queue.
+    8. Blasts        Expanding detonation circles + particles.
     9. Game state    Title, play, pause, tally, win, game over, high score.
    10. Update        Move everything each frame.
    11. Draw          Field, units, HUD, overlays.
@@ -27,7 +27,7 @@
    ============================================================================= */
 
 const CONFIG = {
-  VERSION: "0.1.0-stub",
+  VERSION: "1.0.0",
   WIDTH: 480,
   HEIGHT: 720,
 
@@ -37,15 +37,39 @@ const CONFIG = {
   BLAST_GROW: 120,
   BLAST_HOLD: 0.35,
   BLAST_FADE: 0.45,
+  BLAST_GROW_TIME: 0.22,
   SPLIT_CHANCE: 0.25,
+  SPLIT_Y_MIN: 160,
+  SPLIT_Y_MAX: 320,
+  SPLIT_CHILDREN: 2,
   WAVE_SPEED_STEP: 0.08,
   BOMBER_FROM_WAVE: 3,
+  BOMBERS_PER_WAVE: 1,
+  BOMBER_SPEED: 55,
+  BOMBER_DROP_GAP: 1.4,
+  BOMBER_Y_MIN: 70,
+  BOMBER_Y_MAX: 160,
   WAVES_TO_WIN: 10,
 
   GROUND_Y: 640,
   WARHEAD_SPEED: 28,
-  STUB_WARHEADS: 4,
-  TALLY_TIME: 2.4,
+  WARHEADS_BASE: 6,
+  WARHEADS_PER_WAVE: 2,
+  SPAWN_GAP: 0.8,
+  SPAWN_STAGGER: 0.35,
+  CITY_HIT_RADIUS: 70,
+  BATTERY_HIT_RADIUS: 36,
+  TALLY_TIME: 2.8,
+  TALLY_COUNT_SPEED: 420,
+
+  SCORE_WARHEAD: 25,
+  SCORE_BOMBER: 100,
+  SCORE_CITY: 100,
+  SCORE_AMMO: 5,
+  SCORE_MULT_EVERY: 2,
+
+  FLASH_TIME: 0.22,
+  PARTICLE_LIFE: 0.45,
 
   MUSIC_TRACKS: [
     "Music/Night Battery.mp3", // waves
@@ -84,6 +108,10 @@ const COLORS = {
   bridgeRail: "#4a4844",
   debug: "#c8f0a8",
   danger: "#d45444",
+  bomber: "#d8c070",
+  bomberWing: "#a89050",
+  particle: "#ffe0a0",
+  flash: "rgba(255, 220, 160, 0.28)",
 };
 
 // -----------------------------------------------------------------------------
@@ -221,6 +249,20 @@ function soundHit() {
 function soundClear() {
   playTone(392, 0.12, "square", 0.07);
   playTone(523, 0.14, "square", 0.07, 0, 0.12);
+}
+
+function soundSplit() {
+  playTone(520, 0.08, "square", 0.06, 780);
+  playTone(780, 0.1, "triangle", 0.05, 320, 0.06);
+}
+
+function soundBomber() {
+  playTone(90, 0.5, "sawtooth", 0.045, 60);
+}
+
+function soundCityDown() {
+  playTone(180, 0.28, "square", 0.1, 50);
+  playTone(90, 0.4, "sawtooth", 0.08, 30, 0.12);
 }
 
 // -----------------------------------------------------------------------------
@@ -530,14 +572,17 @@ function bindInput() {
 }
 
 // -----------------------------------------------------------------------------
-// 5–8. Cities, batteries, warheads, blasts (STUB)
+// 5–8. Cities, batteries, warheads, bombers, blasts
 // -----------------------------------------------------------------------------
 
 const cities = [];
 const batteries = [];
 const warheads = [];
+const bombers = [];
+const pending = [];
 const blasts = [];
 const abms = [];
+const particles = [];
 
 function livingCityCount() {
   let n = 0;
@@ -555,6 +600,14 @@ function livingBatteryCount() {
   return n;
 }
 
+function waveSpeed() {
+  return CONFIG.WARHEAD_SPEED * (1 + (game.wave - 1) * CONFIG.WAVE_SPEED_STEP);
+}
+
+function scoreMultiplier() {
+  return 1 + Math.floor((game.wave - 1) / CONFIG.SCORE_MULT_EVERY);
+}
+
 function resetCities() {
   cities.length = 0;
   const gap = CONFIG.WIDTH / (CONFIG.CITY_COUNT + 1);
@@ -564,6 +617,7 @@ function resetCities() {
       y: CONFIG.GROUND_Y,
       alive: true,
       label: CITY_LABELS[i] || "C" + (i + 1),
+      flash: 0,
     });
   }
 }
@@ -577,35 +631,178 @@ function resetBatteries() {
       y: CONFIG.GROUND_Y + 8,
       ammo: CONFIG.MISSILES_PER_BATTERY,
       alive: true,
+      flash: 0,
     });
   }
 }
 
 function clearProjectiles() {
   warheads.length = 0;
+  bombers.length = 0;
+  pending.length = 0;
   blasts.length = 0;
   abms.length = 0;
+  particles.length = 0;
 }
 
-function seedStubWarheads() {
-  warheads.length = 0;
-  const rng = makeRng(game.seed ^ (game.wave * 9973));
-  const speed = CONFIG.WARHEAD_SPEED * (1 + (game.wave - 1) * CONFIG.WAVE_SPEED_STEP);
-  for (let i = 0; i < CONFIG.STUB_WARHEADS; i += 1) {
-    const tx = 40 + rng() * (CONFIG.WIDTH - 80);
-    const sx = 20 + rng() * (CONFIG.WIDTH - 40);
-    warheads.push({
-      x: sx,
-      y: -10 - rng() * 80,
-      sx: sx,
-      sy: -20,
-      tx: tx,
-      ty: CONFIG.GROUND_Y,
-      speed: speed * (0.85 + rng() * 0.3),
-      split: rng() < CONFIG.SPLIT_CHANCE,
-      alive: true,
+function livingTargets() {
+  const list = [];
+  for (let i = 0; i < cities.length; i += 1) {
+    if (cities[i].alive) list.push({ kind: "city", index: i, x: cities[i].x, y: cities[i].y });
+  }
+  for (let i = 0; i < batteries.length; i += 1) {
+    if (batteries[i].alive) {
+      list.push({ kind: "battery", index: i, x: batteries[i].x, y: batteries[i].y });
+    }
+  }
+  return list;
+}
+
+function livingCitiesOnly() {
+  const list = [];
+  for (let i = 0; i < cities.length; i += 1) {
+    if (cities[i].alive) list.push({ kind: "city", index: i, x: cities[i].x, y: cities[i].y });
+  }
+  return list;
+}
+
+function pickTarget(rng, preferCities) {
+  const pool = preferCities ? livingCitiesOnly() : livingTargets();
+  if (!pool.length) {
+    return { kind: "ground", index: -1, x: 40 + rng() * (CONFIG.WIDTH - 80), y: CONFIG.GROUND_Y };
+  }
+  return pool[Math.floor(rng() * pool.length)];
+}
+
+function spawnParticles(x, y, count, speed) {
+  const n = count || 10;
+  const spd = speed || 80;
+  for (let i = 0; i < n; i += 1) {
+    const ang = Math.random() * Math.PI * 2;
+    const v = spd * (0.35 + Math.random() * 0.85);
+    particles.push({
+      x: x,
+      y: y,
+      vx: Math.cos(ang) * v,
+      vy: Math.sin(ang) * v,
+      life: CONFIG.PARTICLE_LIFE * (0.5 + Math.random() * 0.5),
+      maxLife: CONFIG.PARTICLE_LIFE,
+      size: 1 + Math.random() * 2,
     });
   }
+}
+
+function destroyCity(city) {
+  if (!city || !city.alive) return;
+  city.alive = false;
+  city.flash = CONFIG.FLASH_TIME;
+  spawnParticles(city.x, city.y - 10, 14, 110);
+  soundCityDown();
+  refreshMusicBed();
+}
+
+function destroyBattery(bat) {
+  if (!bat || !bat.alive) return;
+  bat.alive = false;
+  bat.ammo = 0;
+  bat.flash = CONFIG.FLASH_TIME;
+  spawnParticles(bat.x, bat.y - 10, 12, 100);
+  soundBoom();
+}
+
+function makeWarhead(sx, sy, target, speed, canSplit, rng) {
+  const split = canSplit && rng() < CONFIG.SPLIT_CHANCE;
+  return {
+    x: sx,
+    y: sy,
+    sx: sx,
+    sy: sy,
+    tx: target.x,
+    ty: CONFIG.GROUND_Y,
+    targetKind: target.kind,
+    targetIndex: target.index,
+    speed: speed,
+    canSplit: split,
+    splitAt: split
+      ? CONFIG.SPLIT_Y_MIN + rng() * (CONFIG.SPLIT_Y_MAX - CONFIG.SPLIT_Y_MIN)
+      : -1,
+    alive: true,
+  };
+}
+
+function spawnWarhead(rng) {
+  const target = pickTarget(rng, false);
+  const sx = 20 + rng() * (CONFIG.WIDTH - 40);
+  const sy = -10 - rng() * 60;
+  const speed = waveSpeed() * (0.85 + rng() * 0.3);
+  warheads.push(makeWarhead(sx, sy, target, speed, true, rng));
+}
+
+function spawnBomber(rng) {
+  const fromLeft = rng() < 0.5;
+  const y = CONFIG.BOMBER_Y_MIN + rng() * (CONFIG.BOMBER_Y_MAX - CONFIG.BOMBER_Y_MIN);
+  bombers.push({
+    x: fromLeft ? -24 : CONFIG.WIDTH + 24,
+    y: y,
+    dir: fromLeft ? 1 : -1,
+    speed: CONFIG.BOMBER_SPEED * (0.9 + rng() * 0.2),
+    dropTimer: CONFIG.BOMBER_DROP_GAP * (0.4 + rng() * 0.4),
+    alive: true,
+  });
+  soundBomber();
+}
+
+function buildWaveSchedule() {
+  pending.length = 0;
+  const rng = makeRng(game.seed ^ (game.wave * 9973) ^ 0x51f5);
+  const warheadCount = CONFIG.WARHEADS_BASE + (game.wave - 1) * CONFIG.WARHEADS_PER_WAVE;
+  let t = 0.15;
+  for (let i = 0; i < warheadCount; i += 1) {
+    pending.push({ delay: t, kind: "warhead" });
+    t += CONFIG.SPAWN_GAP + rng() * CONFIG.SPAWN_STAGGER;
+  }
+  if (game.wave >= CONFIG.BOMBER_FROM_WAVE) {
+    const bomberCount = CONFIG.BOMBERS_PER_WAVE + Math.floor((game.wave - CONFIG.BOMBER_FROM_WAVE) / 3);
+    for (let i = 0; i < bomberCount; i += 1) {
+      const mid = (i + 1) / (bomberCount + 1);
+      const delay = mid * t * 0.85 + rng() * 0.4;
+      pending.push({ delay: delay, kind: "bomber" });
+    }
+    pending.sort(function (a, b) {
+      return a.delay - b.delay;
+    });
+  }
+  game.spawnElapsed = 0;
+  game.waveRng = makeRng(game.seed ^ (game.wave * 7919) ^ 0xa11e);
+}
+
+function updatePending(dt) {
+  if (!pending.length) return;
+  game.spawnElapsed += dt;
+  while (pending.length && pending[0].delay <= game.spawnElapsed) {
+    const item = pending.shift();
+    if (item.kind === "bomber") spawnBomber(game.waveRng);
+    else spawnWarhead(game.waveRng);
+  }
+}
+
+function splitWarhead(w, rng) {
+  const children = [];
+  const used = {};
+  for (let i = 0; i < CONFIG.SPLIT_CHILDREN; i += 1) {
+    let target = pickTarget(rng, true);
+    let guard = 0;
+    while (used[target.kind + ":" + target.index] && guard < 6) {
+      target = pickTarget(rng, false);
+      guard += 1;
+    }
+    used[target.kind + ":" + target.index] = true;
+    const speed = w.speed * (1.05 + rng() * 0.2);
+    children.push(makeWarhead(w.x, w.y, target, speed, false, rng));
+  }
+  soundSplit();
+  spawnParticles(w.x, w.y, 8, 60);
+  return children;
 }
 
 function nearestLivingBattery(tx, preferIndex) {
@@ -632,12 +829,13 @@ function spawnBlast(x, y) {
     x: x,
     y: y,
     r: 4,
-    maxR: CONFIG.BLAST_GROW * 0.35,
+    maxR: CONFIG.BLAST_GROW,
     grow: true,
     hold: CONFIG.BLAST_HOLD,
     fade: CONFIG.BLAST_FADE,
     alpha: 1,
   });
+  spawnParticles(x, y, 16, 140);
   soundBoom();
 }
 
@@ -682,7 +880,49 @@ function updateAbms(dt) {
   }
 }
 
+function applyGroundHit(w) {
+  // Prefer the intended target if still alive and close enough.
+  if (w.targetKind === "city" && w.targetIndex >= 0 && w.targetIndex < cities.length) {
+    const c = cities[w.targetIndex];
+    if (c.alive && Math.abs(c.x - w.x) < CONFIG.CITY_HIT_RADIUS) {
+      destroyCity(c);
+      return;
+    }
+  }
+  if (w.targetKind === "battery" && w.targetIndex >= 0 && w.targetIndex < batteries.length) {
+    const b = batteries[w.targetIndex];
+    if (b.alive && Math.abs(b.x - w.x) < CONFIG.BATTERY_HIT_RADIUS) {
+      destroyBattery(b);
+      return;
+    }
+  }
+
+  let hitCity = null;
+  let bestCity = Infinity;
+  for (let c = 0; c < cities.length; c += 1) {
+    if (!cities[c].alive) continue;
+    const d = Math.abs(cities[c].x - w.x);
+    if (d < bestCity) {
+      bestCity = d;
+      hitCity = cities[c];
+    }
+  }
+  if (hitCity && bestCity < CONFIG.CITY_HIT_RADIUS) {
+    destroyCity(hitCity);
+    return;
+  }
+
+  for (let b = 0; b < batteries.length; b += 1) {
+    if (!batteries[b].alive) continue;
+    if (Math.abs(batteries[b].x - w.x) < CONFIG.BATTERY_HIT_RADIUS) {
+      destroyBattery(batteries[b]);
+      return;
+    }
+  }
+}
+
 function updateWarheads(dt) {
+  const newborns = [];
   for (let i = warheads.length - 1; i >= 0; i -= 1) {
     const w = warheads[i];
     if (!w.alive) {
@@ -697,13 +937,22 @@ function updateWarheads(dt) {
     w.x += ux * w.speed * dt;
     w.y += uy * w.speed * dt;
 
-    // Blast intercept (stub)
+    if (w.canSplit && w.splitAt > 0 && w.y >= w.splitAt) {
+      w.alive = false;
+      w.canSplit = false;
+      const kids = splitWarhead(w, game.waveRng || makeRng(game.seed));
+      for (let k = 0; k < kids.length; k += 1) newborns.push(kids[k]);
+      warheads.splice(i, 1);
+      continue;
+    }
+
     for (let j = 0; j < blasts.length; j += 1) {
       const b = blasts[j];
       if (Math.hypot(w.x - b.x, w.y - b.y) < b.r) {
         w.alive = false;
-        addScore(25);
+        addScore(CONFIG.SCORE_WARHEAD * scoreMultiplier());
         soundHit();
+        spawnParticles(w.x, w.y, 6, 70);
         break;
       }
     }
@@ -713,34 +962,51 @@ function updateWarheads(dt) {
     }
 
     if (w.y >= CONFIG.GROUND_Y - 2) {
-      // Hit ground — destroy nearest living city (stub)
-      let hit = null;
-      let best = Infinity;
-      for (let c = 0; c < cities.length; c += 1) {
-        if (!cities[c].alive) continue;
-        const d = Math.abs(cities[c].x - w.x);
-        if (d < best) {
-          best = d;
-          hit = cities[c];
-        }
-      }
-      if (hit && best < 70) {
-        hit.alive = false;
-        soundBoom();
-        refreshMusicBed();
-      } else {
-        // Maybe hit a battery
-        for (let b = 0; b < batteries.length; b += 1) {
-          if (!batteries[b].alive) continue;
-          if (Math.abs(batteries[b].x - w.x) < 36) {
-            batteries[b].alive = false;
-            batteries[b].ammo = 0;
-            soundBoom();
-            break;
-          }
-        }
-      }
+      applyGroundHit(w);
       warheads.splice(i, 1);
+    }
+  }
+  for (let i = 0; i < newborns.length; i += 1) warheads.push(newborns[i]);
+}
+
+function updateBombers(dt) {
+  for (let i = bombers.length - 1; i >= 0; i -= 1) {
+    const bom = bombers[i];
+    if (!bom.alive) {
+      bombers.splice(i, 1);
+      continue;
+    }
+
+    bom.x += bom.dir * bom.speed * dt;
+    bom.dropTimer -= dt;
+    if (bom.dropTimer <= 0 && livingCityCount() > 0) {
+      bom.dropTimer = CONFIG.BOMBER_DROP_GAP;
+      const rng = game.waveRng || makeRng(game.seed);
+      const target = pickTarget(rng, true);
+      const speed = waveSpeed() * (0.95 + rng() * 0.2);
+      warheads.push(makeWarhead(bom.x, bom.y + 6, target, speed, false, rng));
+    }
+
+    let killed = false;
+    for (let j = 0; j < blasts.length; j += 1) {
+      const b = blasts[j];
+      if (Math.hypot(bom.x - b.x, bom.y - b.y) < b.r + 8) {
+        bom.alive = false;
+        addScore(CONFIG.SCORE_BOMBER * scoreMultiplier());
+        spawnParticles(bom.x, bom.y, 18, 150);
+        soundHit();
+        soundBoom();
+        killed = true;
+        break;
+      }
+    }
+    if (killed) {
+      bombers.splice(i, 1);
+      continue;
+    }
+
+    if (bom.x < -40 || bom.x > CONFIG.WIDTH + 40) {
+      bombers.splice(i, 1);
     }
   }
 }
@@ -749,7 +1015,7 @@ function updateBlasts(dt) {
   for (let i = blasts.length - 1; i >= 0; i -= 1) {
     const b = blasts[i];
     if (b.grow) {
-      b.r += (b.maxR / 0.22) * dt;
+      b.r += (b.maxR / CONFIG.BLAST_GROW_TIME) * dt;
       if (b.r >= b.maxR) {
         b.r = b.maxR;
         b.grow = false;
@@ -761,6 +1027,29 @@ function updateBlasts(dt) {
       b.alpha = clamp(b.fade / CONFIG.BLAST_FADE, 0, 1);
       if (b.fade <= 0) blasts.splice(i, 1);
     }
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i -= 1) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) {
+      particles.splice(i, 1);
+      continue;
+    }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 40 * dt;
+  }
+}
+
+function updateFlashes(dt) {
+  for (let i = 0; i < cities.length; i += 1) {
+    if (cities[i].flash > 0) cities[i].flash -= dt;
+  }
+  for (let i = 0; i < batteries.length; i += 1) {
+    if (batteries[i].flash > 0) batteries[i].flash -= dt;
   }
 }
 
@@ -783,6 +1072,11 @@ const game = {
   wave: 1,
   tallyTimer: 0,
   tallyBonus: 0,
+  tallyDisplay: 0,
+  tallyAwarded: 0,
+  tallyMult: 1,
+  spawnElapsed: 0,
+  waveRng: null,
   newRecord: false,
   startHigh: 0,
   debug: false,
@@ -828,7 +1122,7 @@ function startWave() {
   for (let i = 0; i < batteries.length; i += 1) {
     if (batteries[i].alive) batteries[i].ammo = CONFIG.MISSILES_PER_BATTERY;
   }
-  seedStubWarheads();
+  buildWaveSchedule();
   game.state = "playing";
   aim.selectedBattery = -1;
   refreshMusicBed();
@@ -839,8 +1133,10 @@ function beginTally() {
   const ammoLeft = batteries.reduce(function (sum, b) {
     return sum + (b.alive ? b.ammo : 0);
   }, 0);
-  game.tallyBonus = citiesLeft * 100 + ammoLeft * 5;
-  addScore(game.tallyBonus);
+  game.tallyMult = scoreMultiplier();
+  game.tallyBonus = (citiesLeft * CONFIG.SCORE_CITY + ammoLeft * CONFIG.SCORE_AMMO) * game.tallyMult;
+  game.tallyDisplay = 0;
+  game.tallyAwarded = 0;
   game.tallyTimer = CONFIG.TALLY_TIME;
   game.state = "tally";
   soundClear();
@@ -848,6 +1144,11 @@ function beginTally() {
 }
 
 function endTally() {
+  const remaining = game.tallyBonus - game.tallyAwarded;
+  if (remaining > 0) addScore(remaining);
+  game.tallyDisplay = game.tallyBonus;
+  game.tallyAwarded = game.tallyBonus;
+
   if (game.wave >= CONFIG.WAVES_TO_WIN) {
     saveHighScore();
     game.state = "won";
@@ -871,6 +1172,9 @@ function startRun(freshSeed) {
   game.wave = 1;
   game.tallyTimer = 0;
   game.tallyBonus = 0;
+  game.tallyDisplay = 0;
+  game.tallyAwarded = 0;
+  game.tallyMult = 1;
   game.newRecord = false;
   game.startHigh = game.highScore;
   aim.x = CONFIG.WIDTH / 2;
@@ -887,7 +1191,13 @@ function checkWaveClearOrLoss() {
     setMusicBed(0);
     return;
   }
-  if (warheads.length === 0 && abms.length === 0 && blasts.length === 0) {
+  if (
+    pending.length === 0 &&
+    warheads.length === 0 &&
+    bombers.length === 0 &&
+    abms.length === 0 &&
+    blasts.length === 0
+  ) {
     beginTally();
   }
 }
@@ -913,11 +1223,25 @@ function update(dt) {
   for (let i = 0; i < padUi.flash.length; i += 1) {
     if (padUi.flash[i] > 0) padUi.flash[i] -= dt;
   }
+  updateFlashes(dt);
+  updateParticles(dt);
 
   if (game.state === "title") return;
   if (game.state === "paused" || game.state === "gameover" || game.state === "won") return;
 
   if (game.state === "tally") {
+    if (game.tallyDisplay < game.tallyBonus) {
+      game.tallyDisplay = Math.min(
+        game.tallyBonus,
+        game.tallyDisplay + CONFIG.TALLY_COUNT_SPEED * dt
+      );
+      const shown = Math.floor(game.tallyDisplay);
+      const gained = shown - game.tallyAwarded;
+      if (gained > 0) {
+        addScore(gained);
+        game.tallyAwarded = shown;
+      }
+    }
     game.tallyTimer -= dt;
     if (game.tallyTimer <= 0) endTally();
     return;
@@ -925,8 +1249,10 @@ function update(dt) {
 
   if (game.state !== "playing") return;
 
+  updatePending(dt);
   updateAbms(dt);
   updateWarheads(dt);
+  updateBombers(dt);
   updateBlasts(dt);
   checkWaveClearOrLoss();
 }
@@ -968,6 +1294,12 @@ function drawCities(ctx) {
     ctx.lineTo(c.x - 14, c.y);
     ctx.closePath();
     ctx.fill();
+    if (c.flash > 0) {
+      ctx.fillStyle = COLORS.flash;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y - 8, 22, 0, Math.PI * 2);
+      ctx.fill();
+    }
     if (c.alive) {
       ctx.fillStyle = COLORS.text;
       ctx.font = "8px Courier New, monospace";
@@ -984,6 +1316,10 @@ function drawBatteries(ctx) {
     const selected = aim.selectedBattery === i;
     ctx.fillStyle = b.alive ? COLORS.battery : COLORS.batteryDead;
     ctx.fillRect(b.x - 14, b.y - 18, 28, 18);
+    if (b.flash > 0) {
+      ctx.fillStyle = COLORS.flash;
+      ctx.fillRect(b.x - 18, b.y - 22, 36, 26);
+    }
     if (selected && b.alive) {
       ctx.strokeStyle = COLORS.accent;
       ctx.lineWidth = 2;
@@ -1006,11 +1342,38 @@ function drawWarheads(ctx) {
     ctx.moveTo(w.sx, w.sy);
     ctx.lineTo(w.x, w.y);
     ctx.stroke();
-    ctx.fillStyle = COLORS.warhead;
+    ctx.fillStyle = w.canSplit ? COLORS.danger : COLORS.warhead;
     ctx.beginPath();
-    ctx.arc(w.x, w.y, 3.5, 0, Math.PI * 2);
+    ctx.arc(w.x, w.y, w.canSplit ? 4.2 : 3.5, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+function drawBombers(ctx) {
+  for (let i = 0; i < bombers.length; i += 1) {
+    const bom = bombers[i];
+    const dir = bom.dir;
+    ctx.fillStyle = COLORS.bomber;
+    ctx.beginPath();
+    ctx.moveTo(bom.x + dir * 14, bom.y);
+    ctx.lineTo(bom.x - dir * 8, bom.y - 7);
+    ctx.lineTo(bom.x - dir * 4, bom.y);
+    ctx.lineTo(bom.x - dir * 8, bom.y + 7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = COLORS.bomberWing;
+    ctx.fillRect(bom.x - 10, bom.y - 2, 20, 4);
+  }
+}
+
+function drawParticles(ctx) {
+  for (let i = 0; i < particles.length; i += 1) {
+    const p = particles[i];
+    ctx.globalAlpha = clamp(p.life / p.maxLife, 0, 1);
+    ctx.fillStyle = COLORS.particle;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
 }
 
 function drawAbms(ctx) {
@@ -1164,15 +1527,36 @@ function drawTally(ctx) {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.font = "bold 28px Courier New, monospace";
-  ctx.fillText("WAVE " + game.wave + " CLEAR", CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2 - 40);
+  ctx.fillText("WAVE " + game.wave + " CLEAR", CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2 - 56);
   ctx.fillStyle = COLORS.text;
   ctx.font = "18px Courier New, monospace";
-  ctx.fillText("BONUS +" + game.tallyBonus, CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2 + 4);
+  ctx.fillText(
+    "BONUS +" + Math.floor(game.tallyDisplay),
+    CONFIG.WIDTH / 2,
+    CONFIG.HEIGHT / 2 - 8
+  );
+  ctx.font = "14px Courier New, monospace";
+  ctx.fillText("×" + game.tallyMult + " WAVE MULT", CONFIG.WIDTH / 2, CONFIG.HEIGHT / 2 + 22);
   ctx.font = "14px Courier New, monospace";
   ctx.fillText(
     isTouchDevice ? "…" : "Enter to continue",
     CONFIG.WIDTH / 2,
-    CONFIG.HEIGHT / 2 + 40
+    CONFIG.HEIGHT / 2 + 52
+  );
+}
+
+function drawDebug(ctx) {
+  ctx.fillStyle = COLORS.debug;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.font = "12px Courier New, monospace";
+  ctx.fillText("FPS " + game.fps, 8, 66);
+  ctx.fillText("SEED " + game.seed, 8, 82);
+  ctx.fillText("CITIES " + livingCityCount(), 8, 98);
+  ctx.fillText(
+    "IN " + warheads.length + " B " + bombers.length + " Q " + pending.length,
+    8,
+    114
   );
 }
 
@@ -1219,17 +1603,6 @@ function drawWin(ctx) {
     CONFIG.WIDTH / 2,
     CONFIG.HEIGHT / 2 + 72
   );
-}
-
-function drawDebug(ctx) {
-  ctx.fillStyle = COLORS.debug;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
-  ctx.font = "12px Courier New, monospace";
-  ctx.fillText("FPS " + game.fps, 8, 66);
-  ctx.fillText("SEED " + game.seed, 8, 82);
-  ctx.fillText("CITIES " + livingCityCount(), 8, 98);
-  ctx.fillText("STUB — see PROMPT.md", 8, 114);
 }
 
 function drawPad(padCtx) {
@@ -1280,8 +1653,10 @@ function draw(ctx) {
     drawCities(ctx);
     drawBatteries(ctx);
     drawWarheads(ctx);
+    drawBombers(ctx);
     drawAbms(ctx);
     drawBlasts(ctx);
+    drawParticles(ctx);
     drawCrosshair(ctx);
   }
 
